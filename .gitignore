@@ -1,0 +1,7 @@
+private_data/
+__pycache__/
+*.pyc
+.venv/
+client_secret*.json
+credentials.json
+
