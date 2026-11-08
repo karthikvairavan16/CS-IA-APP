@@ -1,5 +1,7 @@
 # IA Project setup and current behavior
 
+For deployment on a public HTTPS URL with a persistent online SQLite database, follow [DEPLOY_ONLINE.md](DEPLOY_ONLINE.md). The steps below also document local development.
+
 ## 1. Run locally
 
 Use Windows and Python 3.11 or newer. In a PowerShell terminal in this folder:

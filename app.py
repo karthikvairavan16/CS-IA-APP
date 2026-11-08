@@ -1,8 +1,4 @@
-"""IA Project: a local, Python-standard-library Gmail prioritizer.
-
-Run: python app.py --configure (once), then python app.py.
-This server binds to localhost; use a production framework/server before hosting.
-"""
+"""IA Project: Python Gmail prioritizer. Run locally or on a single Railway service."""
 import argparse
 import base64
 from contextlib import contextmanager
@@ -30,11 +26,16 @@ from urllib import error, parse, request
 from views import PAGE
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / 'private_data'
+HOSTED = bool(os.environ.get('RAILWAY_SERVICE_ID'))
+DATA = Path(os.environ.get('DATA_DIR') or os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') or ROOT / 'private_data')
 DB = DATA / 'staffroom.db'
 CONFIG = DATA / 'google.json'
-ORIGIN = 'http://localhost:8000'
+ORIGIN = (os.environ.get('APP_ORIGIN') or
+          ('https://' + os.environ['RAILWAY_PUBLIC_DOMAIN'] if os.environ.get('RAILWAY_PUBLIC_DOMAIN') else
+           'http://localhost:8000')).rstrip('/')
 REDIRECT = ORIGIN + '/auth/callback'
+HOST = parse.urlsplit(ORIGIN).netloc
+PORT = int(os.environ.get('PORT', '8000'))
 SCOPE = 'openid email profile https://www.googleapis.com/auth/gmail.modify'
 GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me'
 SYNC_LOCK = threading.Lock()
@@ -95,9 +96,18 @@ def init_db():
 
 
 def protect(text, decrypt=False):
-    """Windows DPAPI encrypts OAuth tokens for the current OS user, at rest."""
+    """Use a stable Fernet key in hosting; retain Windows DPAPI for local data."""
+    master_key = os.environ.get('TOKEN_ENCRYPTION_KEY')
+    if master_key:
+        try:
+            from cryptography.fernet import Fernet, InvalidToken
+            cipher = Fernet(master_key.encode())
+            return (cipher.decrypt(text.encode()).decode() if decrypt else
+                    cipher.encrypt(text.encode()).decode())
+        except (ValueError, InvalidToken):
+            raise AppError('The token encryption key is invalid or has changed. Restore the original key.', 503) from None
     if os.name != 'nt':
-        raise AppError('This local edition uses Windows DPAPI for token storage. Run it on Windows.', 503)
+        raise AppError('Set TOKEN_ENCRYPTION_KEY to enable encrypted Google credentials on this server.', 503)
     from ctypes import wintypes
 
     class Blob(ctypes.Structure):
@@ -124,9 +134,16 @@ def protect(text, decrypt=False):
 
 
 def google_config():
+    if os.environ.get('GOOGLE_CLIENT_ID') and os.environ.get('GOOGLE_CLIENT_SECRET'):
+        return {'client_id': os.environ['GOOGLE_CLIENT_ID'],
+                'client_secret': os.environ['GOOGLE_CLIENT_SECRET']}
     if not CONFIG.exists():
         raise AppError('Google is not configured yet. In your terminal run: python app.py --configure', 503)
     return json.loads(protect(CONFIG.read_text(), True))
+
+
+def google_is_configured():
+    return bool((os.environ.get('GOOGLE_CLIENT_ID') and os.environ.get('GOOGLE_CLIENT_SECRET')) or CONFIG.exists())
 
 
 def http_json(url, method='GET', payload=None, token=None, form=False):
@@ -523,7 +540,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         if getattr(self, 'new_cookie', None):
-            self.send_header('Set-Cookie', 'staffroom=' + self.new_cookie + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200')
+            secure = '; Secure' if ORIGIN.startswith('https://') else ''
+            self.send_header('Set-Cookie', 'staffroom=' + self.new_cookie + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200' + secure)
         if redirect:
             self.send_header('Location', redirect)
         self.end_headers()
@@ -588,8 +606,12 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, method):
         self.new_cookie = None
         try:
-            if self.headers.get('Host') not in ('localhost:8000', '127.0.0.1:8000'):
-                raise AppError('Use http://localhost:8000 to open this local app.', 403)
+            if method == 'GET' and parse.urlparse(self.path).path == '/healthz':
+                with connect() as con:
+                    con.execute('SELECT 1').fetchone()
+                return self.send({'ok': True})
+            if self.headers.get('Host', '').lower() != HOST.lower():
+                raise AppError('Open this app using its configured public URL.', 403)
             self.sess = self.session()
             url = parse.urlparse(self.path)
             path = url.path
@@ -618,7 +640,7 @@ class Handler(BaseHTTPRequestHandler):
                 if public:
                     public['connected'] = bool(user['tokens'])
                     public['can_reset_password'] = time.time() - self.sess['verified'] < 600
-                return self.send({'csrf': self.sess['csrf'], 'user': public, 'configured': CONFIG.exists()})
+                return self.send({'csrf': self.sess['csrf'], 'user': public, 'configured': google_is_configured()})
             if method == 'POST' and path == '/api/login':
                 self.throttle('login')
                 with connect() as con:
@@ -992,13 +1014,22 @@ if __name__ == '__main__':
     if args.configure:
         configure()
     else:
+        if HOSTED:
+            if not os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') and not os.environ.get('DATA_DIR'):
+                raise SystemExit('Attach a persistent Railway volume at /data before starting.')
+            if not ORIGIN.startswith('https://') or not HOST:
+                raise SystemExit('Generate a Railway public domain or set APP_ORIGIN to your exact https:// public URL.')
+            if not os.environ.get('TOKEN_ENCRYPTION_KEY'):
+                raise SystemExit('Set TOKEN_ENCRYPTION_KEY before starting.')
+            if not google_is_configured():
+                raise SystemExit('Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET before starting.')
         init_db()
-        server = ThreadingHTTPServer(('127.0.0.1', 8000), Handler)
+        server = ThreadingHTTPServer(('0.0.0.0' if HOSTED else '127.0.0.1', PORT), Handler)
         server.daemon_threads = True
         server.label_cache = {}
         print('IA Project is running at ' + ORIGIN)
-        print('Google: ' + ('configured' if CONFIG.exists() else 'not configured; run python app.py --configure in another terminal'))
-        print('Press Ctrl+C to stop. Local development server; do not expose it to the internet.')
+        print('Google: ' + ('configured' if google_is_configured() else 'not configured; run python app.py --configure in another terminal'))
+        print('Press Ctrl+C to stop.')
         try:
             server.serve_forever()
         except KeyboardInterrupt:
